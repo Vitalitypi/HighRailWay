@@ -5,6 +5,9 @@ import torch.nn as nn
 import argparse
 import configparser
 from datetime import datetime
+
+from torchinfo import summary
+
 from model.MSTAGNN import Network
 
 from trainer import Trainer
