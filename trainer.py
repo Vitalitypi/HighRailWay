@@ -17,7 +17,7 @@ class Trainer(object):
     def __init__(self,
                  args,
                  generator,
-                 train_loader, val_loader, test_loader, scaler,
+                 train_loader, val_loader, test_loader, scalers,
                  loss_G,
                  optimizer_G,
                  lr_scheduler_G):
@@ -31,7 +31,7 @@ class Trainer(object):
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.test_loader = test_loader
-        self.scaler = scaler
+        self.scalers = scalers
 
         self.train_per_epoch = len(train_loader)
         if val_loader != None:
@@ -66,8 +66,10 @@ class Trainer(object):
             output = self.model(data)
             # data = data[..., :self.args.flow_dim]
             if self.args.real_value:
-                output = self.scaler.inverse_transform(output)
-                label = self.scaler.inverse_transform(label)
+                output[...,0] = self.scalers[0].inverse_transform(output[...,0])
+                label[...,0] = self.scalers[0].inverse_transform(label[...,0])
+                output[...,1] = self.scalers[1].inverse_transform(output[...,1])
+                label[...,1] = self.scalers[1].inverse_transform(label[...,1])
 
             loss_G = self.loss_G(output.cuda(), label)
             loss_G.backward()
@@ -101,8 +103,10 @@ class Trainer(object):
                 label = target[..., :self.args.output_dim]
                 output = self.model(data)
                 if self.args.real_value:
-                    output = self.scaler.inverse_transform(output)
-                    label = self.scaler.inverse_transform(label)
+                    output[...,0] = self.scalers[0].inverse_transform(output[...,0])
+                    label[...,0] = self.scalers[0].inverse_transform(label[...,0])
+                    output[...,1] = self.scalers[1].inverse_transform(output[...,1])
+                    label[...,1] = self.scalers[1].inverse_transform(label[...,1])
                 loss = self.loss_G(output.cuda(), label)
                 #a whole batch of Metr_LA is filtered
                 if not torch.isnan(loss):
@@ -121,8 +125,10 @@ class Trainer(object):
                 label = target[..., :self.args.output_dim]
                 output = self.model(data)
                 if self.args.real_value:
-                    output = self.scaler.inverse_transform(output)
-                    label = self.scaler.inverse_transform(label)
+                    output[...,0] = self.scalers[0].inverse_transform(output[...,0])
+                    label[...,0] = self.scalers[0].inverse_transform(label[...,0])
+                    output[...,1] = self.scalers[1].inverse_transform(output[...,1])
+                    label[...,1] = self.scalers[1].inverse_transform(label[...,1])
                 loss = self.loss_G(output.cuda(), label)
                 #a whole batch of Metr_LA is filtered
                 if not torch.isnan(loss):
@@ -146,7 +152,8 @@ class Trainer(object):
         loss_dir = os.path.join(current_dir, 'exps/loss')
         if os.path.isdir(loss_dir) == False:
             os.makedirs(loss_dir, exist_ok=True)
-        loss_file = './exps/loss/{}_{}_{}_val_loss.txt'.format(self.args.model, self.args.dataset,str(datetime.datetime.now()))
+        now = datetime.datetime.now()
+        loss_file = './exps/loss/{}_{}_{}-{}-{}_val_loss.txt'.format(self.args.model, self.args.dataset,now.year,now.month,now.day)
         if os.path.exists(loss_file):
             os.remove(loss_file)
             print('Recreate {}'.format(loss_file))
@@ -203,11 +210,11 @@ class Trainer(object):
         #test
         self.model.load_state_dict(best_model)
         #self.val_epoch(self.args.epochs, self.test_loader)
-        self.test(self.model, self.args, self.test_loader, self.scaler, self.logger)
+        self.test(self.model, self.args, self.test_loader, self.scalers, self.logger)
 
         self.logger.info("This is best_test_model")
         self.model.load_state_dict(best_test_model)
-        self.test(self.model, self.args, self.test_loader, self.scaler, self.logger)
+        self.test(self.model, self.args, self.test_loader, self.scalers, self.logger)
 
     def save_checkpoint(self):
         state = {
@@ -219,7 +226,7 @@ class Trainer(object):
         self.logger.info("Saving current best model to " + self.best_path)
 
     @staticmethod
-    def test(model, args, data_loader, scaler, logger, path=None):
+    def test(model, args, data_loader, scalers, logger, path=None):
         if path != None:
             check_point = torch.load(os.path.join(path, 'best_model.pth')) # path = args.log_dir
             state_dict = check_point['state_dict']
@@ -239,8 +246,14 @@ class Trainer(object):
 
         #y_true = scaler.inverse_transform(torch.cat(y_true, dim=0))
         if args.real_value:
-            y_pred = scaler.inverse_transform(torch.cat(y_pred, dim=0))
-            y_true = scaler.inverse_transform(torch.cat(y_true, dim=0))
+            y_pred = torch.cat(y_pred, dim=0)
+            y_true = torch.cat(y_true, dim=0)
+            y_pred[...,0] = scalers[0].inverse_transform(y_pred[...,0])
+            y_true[...,0] = scalers[0].inverse_transform(y_true[...,0])
+            y_pred[...,1] = scalers[1].inverse_transform(y_pred[...,1])
+            y_true[...,1] = scalers[1].inverse_transform(y_true[...,1])
+            # y_pred = scaler.inverse_transform(torch.cat(y_pred, dim=0))
+            # y_true = scaler.inverse_transform(torch.cat(y_true, dim=0))
         else:
             y_pred = torch.cat(y_pred, dim=0)
             y_true = torch.cat(y_true, dim=0)

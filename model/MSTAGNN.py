@@ -1,432 +1,500 @@
-import argparse
-import configparser
-from torch import nn
-from torchinfo import summary
-import torch.nn.functional as F
-import torch
+# -*- coding:utf-8 -*-
+
+import mxnet as mx
 
 
-class AttentionLayer(nn.Module):
-    """Perform attention across the -2 dim (the -1 dim is `model_dim`).
+def position_embedding(data,
+                       input_length, num_of_vertices, embedding_size,
+                       temporal=True, spatial=True,
+                       init=mx.init.Xavier(magnitude=0.0003), prefix=""):
+    '''
+    Parameters
+    ----------
+    data: mx.sym.var, shape is (B, T, N, C)
 
-    Make sure the tensor is permuted to correct shape before attention.
+    input_length: int, length of time series, T
 
-    E.g.
-    - Input shape (batch_size, in_steps, num_nodes, model_dim).
-    - Then the attention will be performed across the nodes.
+    num_of_vertices: int, N
 
-    Also, it supports different src and tgt length.
+    embedding_size: int, C
 
-    But must `src length == K length == V length`.
+    temporal, spatial: bool, whether equip this type of embeddings
 
-    """
+    init: mx.initializer.Initializer
 
-    def __init__(self, model_dim, num_heads=8, mask=False):
-        super().__init__()
+    prefix: str
 
-        self.model_dim = model_dim
-        self.num_heads = num_heads
-        self.mask = mask
+    Returns
+    ----------
+    data: output shape is (B, T, N, C)
+    '''
 
-        self.head_dim = model_dim // num_heads
+    temporal_emb = None
+    spatial_emb = None
 
-    def forward(self, query, key, value):
-        batch_size = query.shape[0]
-        tgt_length = query.shape[-2]
-        src_length = key.shape[-2]
-        # Qhead, Khead, Vhead (num_heads * batch_size, ..., length, head_dim)
-        query = torch.cat(torch.split(query, self.head_dim, dim=-1), dim=0)
-        key = torch.cat(torch.split(key, self.head_dim, dim=-1), dim=0)
-        value = torch.cat(torch.split(value, self.head_dim, dim=-1), dim=0)
+    if temporal:
+        # shape is (1, T, 1, C)
+        temporal_emb = mx.sym.var(
+            "{}_t_emb".format(prefix),
+            shape=(1, input_length, 1, embedding_size),
+            init=init
+        )
+    if spatial:
+        # shape is (1, 1, N, C)
+        spatial_emb = mx.sym.var(
+            "{}_v_emb".format(prefix),
+            shape=(1, 1, num_of_vertices, embedding_size),
+            init=init
+        )
 
-        key = key.transpose(
-            -1, -2
-        )  # (num_heads * batch_size, ..., head_dim, src_length)
+    if temporal_emb is not None:
+        data = mx.sym.broadcast_add(data, temporal_emb)
+    if spatial_emb is not None:
+        data = mx.sym.broadcast_add(data, spatial_emb)
 
-        attn_score = (
-                             query @ key
-                     ) / self.head_dim ** 0.5  # (num_heads * batch_size, ..., tgt_length, src_length)
-
-        if self.mask:
-            mask = torch.ones(
-                tgt_length, src_length, dtype=torch.bool, device=query.device
-            ).tril()  # lower triangular part of the matrix
-            attn_score.masked_fill_(~mask, -torch.inf)  # fill in-place
-
-        attn_score = torch.softmax(attn_score, dim=-1)
-        out = attn_score @ value  # (num_heads * batch_size, ..., tgt_length, head_dim)
-        out = torch.cat(
-            torch.split(out, batch_size, dim=0), dim=-1
-        )  # (batch_size, ..., tgt_length, head_dim * num_heads = model_dim)
-
-        return out
+    return data
 
 
-class Encoder(nn.Module):
-    def __init__(
-            self,
-            num_nodes,
-            batch_size,
-            periods_embedding_dim,
-            weekend_embedding_dim,
-            input_dim,  # flow, day, weekend, holiday
-            periods=288,
-            weekend=7,
-            embed_dim=12,
-            in_steps=12,
-    ):
-        super(Encoder, self).__init__()
+def gcn_operation(data, adj,
+                  num_of_filter, num_of_features, num_of_vertices,
+                  activation, prefix=""):
+    '''
+    graph convolutional operation, a simple GCN we defined in paper
 
-        self.num_nodes = num_nodes
-        self.periods = periods
-        self.weekend = weekend
-        # 输入的embedding维度
-        # 周期的embedding维度
-        self.periods_embedding_dim = periods_embedding_dim
-        # 每周的embedding维度
-        self.weekend_embedding_dim = weekend_embedding_dim
-        self.in_steps = in_steps
-        self.input_dim = input_dim
-        # period的embedding
-        if periods_embedding_dim > 0:
-            self.periods_embedding = nn.Embedding(periods, periods_embedding_dim)
-        # 每周的embedding
-        if weekend_embedding_dim > 0:
-            self.weekend_embedding = nn.Embedding(weekend, weekend_embedding_dim)
+    Parameters
+    ----------
+    data: mx.sym.var, shape is (3N, B, C)
 
-    def forward(self, x):
-        '''
-        获取当前的动态图
-        :param x:
-        shape:b,ti,n,di
-        :return:
-        shape:b,to,n,do
-        '''
+    adj: mx.sym.var, shape is (3N, 3N)
 
-        features = []
+    num_of_filter: int, C'
 
-        if self.periods_embedding_dim > 0:
-            periods = x[..., 1]
-            periods_emb = self.periods_embedding(
-                (periods * self.periods).long()
+    num_of_features: int, C
+
+    num_of_vertices: int, N
+
+    activation: str, {'GLU', 'relu'}
+
+    prefix: str
+
+    Returns
+    ----------
+    output shape is (3N, B, C')
+
+    '''
+
+    assert activation in {'GLU', 'relu'}
+
+    # shape is (3N, B, C)
+    data = mx.sym.dot(adj, data)
+
+    if activation == 'GLU':
+
+        # shape is (3N, B, 2C')
+        data = mx.sym.FullyConnected(
+            data,
+            flatten=False,
+            num_hidden=2 * num_of_filter
+        )
+
+        # shape is (3N, B, C'), (3N, B, C')
+        lhs, rhs = mx.sym.split(data, num_outputs=2, axis=2)
+
+        # shape is (3N, B, C')
+        return lhs * mx.sym.sigmoid(rhs)
+
+    elif activation == 'relu':
+
+        # shape is (3N, B, C')
+        return mx.sym.Activation(
+            mx.sym.FullyConnected(
+                data,
+                flatten=False,
+                num_hidden=num_of_filter
+            ), activation
+        )
+
+
+def stsgcm(data, adj,
+           filters, num_of_features, num_of_vertices,
+           activation, prefix=""):
+    '''
+    STSGCM, multiple stacked gcn layers with cropping and max operation
+
+    Parameters
+    ----------
+    data: mx.sym.var, shape is (3N, B, C)
+
+    adj: mx.sym.var, shape is (3N, 3N)
+
+    filters: list[int], list of C'
+
+    num_of_features: int, C
+
+    num_of_vertices: int, N
+
+    activation: str, {'GLU', 'relu'}
+
+    prefix: str
+
+    Returns
+    ----------
+    output shape is (N, B, C')
+
+    '''
+    need_concat = []
+
+    for i in range(len(filters)):
+        data = gcn_operation(
+            data, adj,
+            filters[i], num_of_features, num_of_vertices,
+            activation=activation,
+            prefix="{}_gcn_{}".format(prefix, i)
+        )
+        need_concat.append(data)
+        num_of_features = filters[i]
+
+    # shape of each element is (1, N, B, C')
+    need_concat = [
+        mx.sym.expand_dims(
+            mx.sym.slice(
+                i,
+                begin=(num_of_vertices, None, None),
+                end=(2 * num_of_vertices, None, None)
+            ), 0
+        ) for i in need_concat
+    ]
+
+    # shape is (N, B, C')
+    return mx.sym.max(mx.sym.concat(*need_concat, dim=0), axis=0)
+
+
+def stsgcl(data, adj,
+           T, num_of_vertices, num_of_features, filters,
+           module_type, activation, temporal_emb=True, spatial_emb=True,
+           prefix=""):
+    '''
+    STSGCL
+
+    Parameters
+    ----------
+    data: mx.sym.var, shape is (B, T, N, C)
+
+    adj: mx.sym.var, shape is (3N, 3N)
+
+    T: int, length of time series, T
+
+    num_of_vertices: int, N
+
+    num_of_features: int, C
+
+    filters: list[int], list of C'
+
+    module_type: str, {'sharing', 'individual'}
+
+    activation: str, {'GLU', 'relu'}
+
+    temporal_emb, spatial_emb: bool
+
+    prefix: str
+
+    Returns
+    ----------
+    output shape is (B, T-2, N, C')
+    '''
+
+    assert module_type in {'sharing', 'individual'}
+
+    if module_type == 'individual':
+        return sthgcn_layer_individual(
+            data, adj,
+            T, num_of_vertices, num_of_features, filters,
+            activation, temporal_emb, spatial_emb, prefix
+        )
+    else:
+        return sthgcn_layer_sharing(
+            data, adj,
+            T, num_of_vertices, num_of_features, filters,
+            activation, temporal_emb, spatial_emb, prefix
+        )
+
+
+def sthgcn_layer_individual(data, adj,
+                            T, num_of_vertices, num_of_features, filters,
+                            activation, temporal_emb=True, spatial_emb=True,
+                            prefix=""):
+    '''
+    STSGCL, multiple individual STSGCMs
+
+    Parameters
+    ----------
+    data: mx.sym.var, shape is (B, T, N, C)
+
+    adj: mx.sym.var, shape is (3N, 3N)
+
+    T: int, length of time series, T
+
+    num_of_vertices: int, N
+
+    num_of_features: int, C
+
+    filters: list[int], list of C'
+
+    activation: str, {'GLU', 'relu'}
+
+    temporal_emb, spatial_emb: bool
+
+    prefix: str
+
+    Returns
+    ----------
+    output shape is (B, T-2, N, C')
+    '''
+
+    # shape is (B, T, N, C)
+    data = position_embedding(data, T, num_of_vertices, num_of_features,
+                              temporal_emb, spatial_emb,
+                              prefix="{}_emb".format(prefix))
+    need_concat = []
+    for i in range(T - 2):
+
+        # shape is (B, 3, N, C)
+        t = mx.sym.slice(data, begin=(None, i, None, None),
+                         end=(None, i + 3, None, None))
+
+        # shape is (B, 3N, C)
+        t = mx.sym.reshape(t, (-1, 3 * num_of_vertices, num_of_features))
+
+        # shape is (3N, B, C)
+        t = mx.sym.transpose(t, (1, 0, 2))
+
+        # shape is (N, B, C')
+        t = stsgcm(
+            t, adj, filters, num_of_features, num_of_vertices,
+            activation=activation,
+            prefix="{}_stsgcm_{}".format(prefix, i)
+        )
+
+        # shape is (B, N, C')
+        t = mx.sym.swapaxes(t, 0, 1)
+
+        # shape is (B, 1, N, C')
+        need_concat.append(mx.sym.expand_dims(t, axis=1))
+
+    # shape is (B, T-2, N, C')
+    return mx.sym.concat(*need_concat, dim=1)
+
+
+def sthgcn_layer_sharing(data, adj,
+                         T, num_of_vertices, num_of_features, filters,
+                         activation, temporal_emb=True, spatial_emb=True,
+                         prefix=""):
+    '''
+    STSGCL, multiple a sharing STSGCM
+
+    Parameters
+    ----------
+    data: mx.sym.var, shape is (B, T, N, C)
+
+    adj: mx.sym.var, shape is (3N, 3N)
+
+    T: int, length of time series, T
+
+    num_of_vertices: int, N
+
+    num_of_features: int, C
+
+    filters: list[int], list of C'
+
+    activation: str, {'GLU', 'relu'}
+
+    temporal_emb, spatial_emb: bool
+
+    prefix: str
+
+    Returns
+    ----------
+    output shape is (B, T-2, N, C')
+    '''
+
+    # shape is (B, T, N, C)
+    data = position_embedding(data, T, num_of_vertices, num_of_features,
+                              temporal_emb, spatial_emb,
+                              prefix="{}_emb".format(prefix))
+    need_concat = []
+    for i in range(T - 2):
+        # shape is (B, 3, N, C)
+        t = mx.sym.slice(data, begin=(None, i, None, None),
+                         end=(None, i + 3, None, None))
+
+        # shape is (B, 3N, C)
+        t = mx.sym.reshape(t, (-1, 3 * num_of_vertices, num_of_features))
+
+        # shape is (3N, B, C)
+        t = mx.sym.swapaxes(t, 0, 1)
+        need_concat.append(t)
+
+    # shape is (3N, (T-2)*B, C)
+    t = mx.sym.concat(*need_concat, dim=1)
+
+    # shape is (N, (T-2)*B, C')
+    t = stsgcm(
+        t, adj, filters, num_of_features, num_of_vertices,
+        activation=activation,
+        prefix="{}_stsgcm".format(prefix)
+    )
+
+    # shape is (N, T - 2, B, C)
+    t = t.reshape((num_of_vertices, T - 2, -1, filters[-1]))
+
+    # shape is (B, T - 2, N, C)
+    return mx.sym.swapaxes(t, 0, 2)
+
+
+def output_layer(data, num_of_vertices, input_length, num_of_features,
+                 num_of_filters=128, predict_length=12):
+    '''
+    Parameters
+    ----------
+    data: mx.sym.var, shape is (B, T, N, C)
+
+    num_of_vertices: int, N
+
+    input_length: int, length of time series, T
+
+    num_of_features: int, C
+
+    num_of_filters: int, C'
+
+    predict_length: int, length of predicted time series, T'
+
+    Returns
+    ----------
+    output shape is (B, T', N)
+    '''
+
+    # data shape is (B, N, T, C)
+    data = mx.sym.swapaxes(data, 1, 2)
+
+    # (B, N, T * C)
+    data = mx.sym.reshape(
+        data, (-1, num_of_vertices, input_length * num_of_features)
+    )
+
+    # (B, N, C')
+    data = mx.sym.Activation(
+        mx.sym.FullyConnected(
+            data,
+            flatten=False,
+            num_hidden=num_of_filters
+        ), 'relu'
+    )
+
+    # (B, N, T')
+    data = mx.sym.FullyConnected(
+        data,
+        flatten=False,
+        num_hidden=predict_length
+    )
+
+    # (B, T', N)
+    data = mx.sym.swapaxes(data, 1, 2)
+
+    return data
+
+
+def huber_loss(data, label, rho=1):
+    '''
+    Parameters
+    ----------
+    data: mx.sym.var, shape is (B, T', N)
+
+    label: mx.sym.var, shape is (B, T', N)
+
+    rho: float
+
+    Returns
+    ----------
+    loss: mx.sym
+    '''
+
+    loss = mx.sym.abs(data - label)
+    loss = mx.sym.where(loss > rho, loss - 0.5 * rho,
+                        (0.5 / rho) * mx.sym.square(loss))
+    loss = mx.sym.MakeLoss(loss)
+    return loss
+
+
+def weighted_loss(data, label, input_length, rho=1):
+    '''
+    weighted loss build on huber loss
+
+    Parameters
+    ----------
+    data: mx.sym.var, shape is (B, T', N)
+
+    label: mx.sym.var, shape is (B, T', N)
+
+    input_length: int, T'
+
+    rho: float
+
+    Returns
+    ----------
+    agg_loss: mx.sym
+    '''
+
+    # shape is (1, T, 1)
+    weight = mx.sym.expand_dims(
+        mx.sym.expand_dims(
+            mx.sym.flip(mx.sym.arange(1, input_length + 1), axis=0),
+            axis=0
+        ), axis=-1
+    )
+    agg_loss = mx.sym.broadcast_mul(
+        huber_loss(data, label, rho),
+        weight
+    )
+    return agg_loss
+
+
+def stsgcn(data, adj, label,
+           input_length, num_of_vertices, num_of_features,
+           filter_list, module_type, activation,
+           use_mask=True, mask_init_value=None,
+           temporal_emb=True, spatial_emb=True,
+           prefix="", rho=1, predict_length=12):
+    '''
+    data shape is (B, T, N, C)
+    adj shape is (3N, 3N)
+    label shape is (B, T, N)
+    '''
+    if use_mask:
+        if mask_init_value is None:
+            raise ValueError("mask init value is None!")
+        mask = mx.sym.var("{}_mask".format(prefix),
+                          shape=(3 * num_of_vertices, 3 * num_of_vertices),
+                          init=mask_init_value)
+        adj = mask * adj
+
+    for idx, filters in enumerate(filter_list):
+        data = stsgcl(data, adj, input_length, num_of_vertices,
+                      num_of_features, filters, module_type,
+                      activation=activation,
+                      temporal_emb=temporal_emb,
+                      spatial_emb=spatial_emb,
+                      prefix="{}_stsgcl_{}".format(prefix, idx))
+        input_length -= 2
+        num_of_features = filters[-1]
+    # (B, 1, N)
+    need_concat = []
+    for i in range(predict_length):
+        need_concat.append(
+            output_layer(
+                data, num_of_vertices, input_length, num_of_features,
+                num_of_filters=128, predict_length=1
             )
-            features.append(periods_emb)
-            # time_embedding = torch.mul(time_embedding, periods_emb[:,:,0])
-
-        if self.weekend_embedding_dim > 0:
-            weekend = x[..., 2]
-            weekend_emb = self.weekend_embedding(
-                weekend.long()
-            )  # (batch_size, in_steps, num_nodes, weekend_embedding_dim)
-            features.append(weekend_emb)
-            # time_embedding = torch.mul(time_embedding, weekend_emb[:,:,0])
-        return features
-
-
-class MSTAGNN(nn.Module):
-    def __init__(
-            self,
-            num_nodes,  # 节点数
-            batch_size,
-            input_dim,  # 输入维度
-            rnn_units,  # GRU循环单元数
-            output_dim,  # 输出维度
-            num_layers,  # GRU的层数
-            embed_dim,  # GNN嵌入维度
-            in_steps=12,  # 输入的时间长度
-            out_steps=12,  # 预测的时间长度
-            kernel=1,
-            periods=288,
-            weekend=7,
-            periods_embedding_dim=6,
-            weekend_embedding_dim=6,
-            num_input_dim=1,
-    ):
-        super(MSTAGNN, self).__init__()
-        assert num_input_dim <= input_dim
-        self.num_node = num_nodes
-        self.input_dim = input_dim
-        self.num_input_dim = num_input_dim
-        self.hidden_dim = rnn_units
-        self.output_dim = output_dim
-        self.in_steps = in_steps
-        self.out_steps = out_steps
-        self.embed_dim = embed_dim
-        self.num_layers = num_layers
-        self.periods_embedding_dim = periods_embedding_dim
-        self.weekend_embedding_dim = weekend_embedding_dim
-        self.encoder = Encoder(num_nodes, batch_size, periods_embedding_dim, weekend_embedding_dim, input_dim, periods,
-                               weekend, embed_dim, in_steps)
-        self.node_embeddings = nn.Parameter(torch.randn(num_nodes, embed_dim), requires_grad=True)
-        self.time_embeddings = nn.Parameter(torch.randn(batch_size, in_steps, embed_dim), requires_grad=True)
-
-        self.predictor = MSTARNN(num_nodes, num_input_dim, rnn_units, embed_dim, num_layers, in_steps, out_steps,
-                                 dim_out=output_dim,
-                                 kernel=kernel)
-        self.kernel = kernel
-
-    def forward(self, source):
-        batch_size = source.shape[0]
-        features = self.encoder(source)
-        node_embedding = self.node_embeddings
-        time_embedding = self.time_embeddings[:batch_size]
-        index = 0
-        if self.periods_embedding_dim > 0:
-            emb_periods = features[index]
-            time_embedding = torch.mul(time_embedding, emb_periods[:, :, 0])
-            index += 1
-        if self.weekend_embedding_dim > 0:
-            emb_weekend = features[index]
-            time_embedding = torch.mul(time_embedding, emb_weekend[:, :, 0])
-        init_state = self.predictor.init_hidden(batch_size)  # ,self.num_node,self.hidden_dim
-        _, output = self.predictor(source[..., :self.num_input_dim], init_state,
-                                   [node_embedding, time_embedding])  # B, T, N, hidden
-        return output
-
-
-class MSTARNN(nn.Module):
-    def __init__(self, num_nodes, dim_in, dim_hidden, dim_embed, num_layers, in_steps=12, out_steps=12, dim_out=1,
-                 kernel=2):
-        super(MSTARNN, self).__init__()
-        assert num_layers >= 1, 'At least one GRU layer in the RNN.'
-        self.num_nodes = num_nodes
-        self.input_dim = dim_in
-        self.dim_hidden = dim_hidden
-        self.num_layers = num_layers
-        self.out_steps = out_steps
-        self.kernel = kernel
-        self.grus = nn.ModuleList([
-            MSTACell(num_nodes, dim_in, dim_hidden, dim_embed, self.kernel)
-            for _ in range(self.num_layers)
-        ])
-        # predict output
-        self.predictors = nn.ModuleList([
-            nn.Conv2d(kernel, dim_out * out_steps, kernel_size=(1, dim_hidden))
-            for _ in range(self.num_layers)
-        ])
-        # dropout
-        self.dropouts = nn.ModuleList([
-            nn.Dropout(p=0.1)
-            for _ in range(self.num_layers)
-        ])
-        self.kernel = kernel
-
-    def forward(self, x, init_state, embeddings):
-        # shape of x: (B, T, N, D)
-        assert x.shape[2] == self.num_nodes and x.shape[3] == self.input_dim
-
-        outputs = []
-        seq_length = x.shape[1]  # T
-        current_inputs = x
-        state = init_state.to(x.device)  # b,kernel,n,d
-        for i in range(self.num_layers):
-            inner_states = [state]
-            skip = current_inputs
-            for t in range(0, seq_length, self.kernel):
-                inp_x = current_inputs[:, t:t + self.kernel]  # b,kernel.n,d
-                inp_h = torch.cat(inner_states, dim=1)  # b,t+1,kernel,n,d
-                state = self.grus[i](inp_x, inp_h, [embeddings[0], embeddings[1][:,
-                                                                   t:t + self.kernel]])  # b,n,di*kernel    b,t,n,dh    [(n,de),(b,de)]
-                inner_states.append(state)
-            current_inputs = torch.cat(inner_states[1:], dim=1)  # [B, T, N, D]
-
-            current_inputs = self.dropouts[i](current_inputs[:, -self.kernel:, :, :])
-            outputs.append(self.predictors[i](current_inputs))
-            if i < self.num_layers - 1:
-                current_inputs = skip - outputs[i]
-
-        predict = outputs[0]
-        for i in range(1, len(outputs)):
-            predict = predict + outputs[i]
-        return None, predict
-
-    def init_hidden(self, batch_size):
-        return self.grus[0].init_hidden_state(batch_size)
-
-
-class MSTACell(nn.Module):
-    def __init__(self, num_nodes, dim_in, dim_out, dim_embed, kernel=2):
-        super(MSTACell, self).__init__()
-        self.dim_hidden = dim_out
-        self.num_nodes = num_nodes
-        self.kernel = kernel
-        self.gate_z = TAGCM(dim_in + self.dim_hidden, dim_out, dim_embed, num_nodes, kernel)
-        self.gate_r = TAGCM(dim_in + self.dim_hidden, dim_out, dim_embed, num_nodes, kernel)
-        self.update = TAGCM(dim_in + self.dim_hidden, dim_out, dim_embed, num_nodes, kernel)
-
-    def forward(self, x, states, embeddings):
-        '''
-        :param x:
-            b,steps,n,di
-        :param state:
-            b,t,n,dh
-        :param embedding:
-             [(n,d),(b,steps,d)]
-        :return:
-            b,n,dh
-        '''
-        state = states[:, -self.kernel:]
-        states = states.permute(0, 2, 1, 3)
-        input_and_state = torch.cat((x, state), dim=-1)  # [B, kernel, N, 1+D]
-        z = torch.sigmoid(self.gate_z(input_and_state, states, embeddings))
-        r = torch.sigmoid(self.gate_r(input_and_state, states, embeddings))
-        candidate = torch.cat((x, z * state), dim=-1)
-        hc = torch.tanh(self.update(candidate, states, embeddings))
-        h = r * state + (1 - r) * hc
-        return h
-
-    def init_hidden_state(self, batch_size):
-        return torch.zeros(batch_size, self.kernel, self.num_nodes, self.dim_hidden)
-
-
-class TAGCM(nn.Module):
-    def __init__(self, dim_in, dim_out, dim_embed, num_nodes, kernel, num_heads=4, mask=False, dropout=0.1):
-        super(TAGCM, self).__init__()
-        self.gcn = DSTGCM(dim_in, dim_out, dim_embed, num_nodes, kernel)
-        self.attn = AttentionLayer(dim_out, num_heads, mask)
-        self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(dim_out)
-
-    def forward(self, x, states, embeddings):
-        '''
-        :param x:
-            b,n,di
-        :param states:
-            b,n,t,do
-        :param embeddings:
-            [(n,de),(b,de)]
-        :return:
-            b,n,d
-        '''
-        # 首先通过1个GCN将x维度升至dim_hidden
-        x = self.gcn(x, embeddings)  # b,kernel,n,do
-        residual = x
-        state = self.attn(self.norm(x.transpose(1, 2)), states, states).transpose(1, 2)
-        state = residual + self.dropout(state)  # b,kernel,n,do
-        return state
-
-
-class DSTGCM(nn.Module):
-    def __init__(self, dim_in, dim_out, dim_embed, num_nodes, kernel):
-        super(DSTGCM, self).__init__()
-        self.num_nodes = num_nodes
-        self.dim_embed = dim_embed
-        self.dim_out = dim_out
-        self.dim_in = dim_in
-        self.kernel = kernel
-        self.weights_pool = nn.Parameter(torch.FloatTensor(dim_embed, 2, dim_in, dim_out))  # [D, C, F]
-        self.bias_pool = nn.Parameter(torch.FloatTensor(dim_embed, dim_out))  # [D, F]
-
-        self.norm = nn.LayerNorm(dim_embed, eps=1e-12)
-        self.drop = nn.Dropout(0.1)
-
-    def forward(self, x, embeddings):
-        '''
-        :param x:
-            b,2,n,di
-        :param embeddings:
-            [(n,d),(b,2,d)]
-        :return:
-            b,2,n,do
-        '''
-        node_embeddings, time_embeddings = embeddings[0], embeddings[1]
-        supports1 = torch.eye(self.num_nodes).to(x.device)  # n,n
-        embedding = self.drop(
-            self.norm(node_embeddings.unsqueeze(0).unsqueeze(0) + time_embeddings.unsqueeze(-2)))  # b,2,n,d
-        supports2 = F.softmax(torch.matmul(embedding, embedding.transpose(-2, -1)), dim=-1)  # b,2,n,n
-
-        x_g1 = torch.einsum("nm,btmc->btnc", supports1, x)
-        x_g2 = torch.einsum("btnm,btmc->btnc", supports2, x)
-        x_g = torch.stack([x_g1, x_g2], dim=1)  # b,2,t,n,d
-        weights = torch.einsum('nd,dkio->nkio', node_embeddings, self.weights_pool)  # N, dim_in, dim_out
-        bias = torch.einsum('btd,do->bto', time_embeddings, self.bias_pool)  # b, t, o
-        x_g = x_g.permute(0, 2, 3, 1, 4)  # B, t, n, k, i
-
-        st_gconv = torch.einsum('btnki,nkio->btno', x_g, weights) + bias.unsqueeze(-2)  # b, k, n, o
-        return st_gconv
-
-
-class Network(nn.Module):
-    def __init__(self, args):
-        super(Network, self).__init__()
-        self.mgstgnn = MSTAGNN(args.num_nodes, args.batch_size, args.input_dim, args.rnn_units, args.output_dim,
-                               args.num_layers, args.embed_dim,
-                               in_steps=args.in_steps, out_steps=args.out_steps, kernel=args.kernel,
-                               periods=args.periods, weekend=args.weekend,
-                               periods_embedding_dim=args.periods_embedding_dim,
-                               weekend_embedding_dim=args.weekend_embedding_dim, num_input_dim=args.num_input_dim)
-
-    def forward(self, x):
-        out = self.mgstgnn(x)
-        return out
-
-
-if __name__ == "__main__":
-    args = argparse.ArgumentParser(description='arguments')
-    args.add_argument('--dataset', default='PEMS08', type=str)
-    args.add_argument('--mode', default='train', type=str)
-    args.add_argument('--device', default='cuda:0', type=str, help='indices of GPUs')
-    args.add_argument('--debug', default='False', type=eval)
-    args.add_argument('--model', default='MGSTGNN', type=str)
-    args.add_argument('--cuda', default=True, type=bool)
-    args1 = args.parse_args()
-
-    # get configuration
-    config_file = '../config/{}.conf'.format(args1.dataset)
-    # print('Read configuration file: %s' % (config_file))
-    config = configparser.ConfigParser()
-    config.read(config_file)
-
-    # data
-    args.add_argument('--val_ratio', default=config['data']['val_ratio'], type=float)
-    args.add_argument('--test_ratio', default=config['data']['test_ratio'], type=float)
-    args.add_argument('--in_steps', default=config['data']['in_steps'], type=int)
-    args.add_argument('--out_steps', default=config['data']['out_steps'], type=int)
-    args.add_argument('--num_nodes', default=config['data']['num_nodes'], type=int)
-    args.add_argument('--normalizer', default=config['data']['normalizer'], type=str)
-    args.add_argument('--adj_norm', default=config['data']['adj_norm'], type=eval)
-    # model
-    args.add_argument('--input_dim', default=config['model']['input_dim'], type=int)
-
-    args.add_argument('--num_input_dim', default=config['model']['num_input_dim'], type=int)
-
-    args.add_argument('--periods_embedding_dim', default=config['model']['periods_embedding_dim'], type=int)
-    args.add_argument('--weekend_embedding_dim', default=config['model']['weekend_embedding_dim'], type=int)
-
-    args.add_argument('--output_dim', default=config['model']['output_dim'], type=int)
-    args.add_argument('--embed_dim', default=config['model']['embed_dim'], type=int)
-    args.add_argument('--rnn_units', default=config['model']['rnn_units'], type=int)
-    args.add_argument('--num_layers', default=config['model']['num_layers'], type=int)
-    args.add_argument('--periods', default=config['model']['periods'], type=int)
-    args.add_argument('--weekend', default=config['model']['weekend'], type=int)
-    args.add_argument('--kernel', default=config['model']['kernel'], type=int)
-    # train
-    args.add_argument('--loss_func', default=config['train']['loss_func'], type=str)
-    args.add_argument('--random', default=config['train']['random'], type=eval)
-    args.add_argument('--seed', default=config['train']['seed'], type=int)
-    args.add_argument('--batch_size', default=config['train']['batch_size'], type=int)
-    args.add_argument('--epochs', default=config['train']['epochs'], type=int)
-    args.add_argument('--lr_init', default=config['train']['lr_init'], type=float)
-    args.add_argument('--lr_decay', default=config['train']['lr_decay'], type=eval)
-    args.add_argument('--lr_decay_rate', default=config['train']['lr_decay_rate'], type=float)
-    args.add_argument('--lr_decay_step', default=config['train']['lr_decay_step'], type=str)
-    args.add_argument('--early_stop', default=config['train']['early_stop'], type=eval)
-    args.add_argument('--early_stop_patience', default=config['train']['early_stop_patience'], type=int)
-    args.add_argument('--grad_norm', default=config['train']['grad_norm'], type=eval)
-    args.add_argument('--max_grad_norm', default=config['train']['max_grad_norm'], type=int)
-    args.add_argument('--real_value', default=config['train']['real_value'], type=eval,
-                      help='use real value for loss calculation')
-
-    # test
-    args.add_argument('--mae_thresh', default=config['test']['mae_thresh'], type=eval)
-    args.add_argument('--mape_thresh', default=config['test']['mape_thresh'], type=float)
-    # log
-    args.add_argument('--log_dir', default='./', type=str)
-    args.add_argument('--log_step', default=config['log']['log_step'], type=int)
-    args.add_argument('--plot', default=config['log']['plot'], type=eval)
-    args = args.parse_args()
-    from utils.util import init_seed
-
-    init_seed(args.seed)
-    model = Network(args)
-    summary(model, [args.batch_size, args.in_steps, args.num_nodes, args.input_dim])
+        )
+    data = mx.sym.concat(*need_concat, dim=1)
+    loss = huber_loss(data, label, rho=rho)
+    return mx.sym.Group([loss, mx.sym.BlockGrad(data, name='pred')])

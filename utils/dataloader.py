@@ -43,21 +43,37 @@ def get_tod_dow(dataset,time_stamps,num_nodes,periods,out_steps=12):
 # For PEMS03/04/07/08 Datasets
 def get_dataloader_pems(dataset, batch_size=64, val_ratio=0.2, test_ratio=0.2, in_steps=12, out_steps=12, periods=288):
     # load data
-    data = np.load('./dataset/{}/{}.npz'.format(dataset, dataset))['data'][...,:1]
+    data = np.load('./dataset/{}/{}.npz'.format(dataset, dataset))['data']
     # print the shape of data
     print(data.shape)
     time_stamps, num_nodes, _ = data.shape
-    # tods = get_tod(periods,time_stamps,num_nodes)
-    time_features = get_tod_dow(dataset,time_stamps,num_nodes,periods)
-    # concatenate all data
-    data = np.concatenate([data,time_features[...,:2]],axis=-1)
+    if dataset.lower()!='highrailway':
+        # tods = get_tod(periods,time_stamps,num_nodes)
+        time_features = get_tod_dow(dataset,time_stamps,num_nodes,periods)
+        # concatenate all data
+        data = np.concatenate([data,time_features[...,:2]],axis=-1)
 
     # normalize data(only normalize the first dimension data)
     mean = data[..., 0].mean()
     std = data[..., 0].std()
-    scaler = StandardScaler(mean, std)
-    data[..., 0] = scaler.transform(data[..., 0])
-    
+    scaler0 = StandardScaler(mean, std)
+    data[..., 0] = scaler0.transform(data[..., 0])
+
+    mean = data[..., 1].mean()
+    std = data[..., 1].std()
+    scaler1 = StandardScaler(mean, std)
+    data[..., 1] = scaler1.transform(data[..., 1])
+
+    mean = data[..., 2].mean()
+    std = data[..., 2].std()
+    scaler2 = StandardScaler(mean, std)
+    data[..., 2] = scaler2.transform(data[..., 2])
+
+    mean = data[..., 3].mean()
+    std = data[..., 3].std()
+    scaler3 = StandardScaler(mean, std)
+    data[..., 3] = scaler3.transform(data[..., 3])
+
     # spilit dataset by days or by ratio
     data_train, data_val, data_test = split_data_by_ratio(data, val_ratio, test_ratio)
     # add time window [B, N, 1]
@@ -77,7 +93,7 @@ def get_dataloader_pems(dataset, batch_size=64, val_ratio=0.2, test_ratio=0.2, i
         val_dataloader = data_loader(x_val, y_val, batch_size, shuffle=False, drop_last=True)
     test_dataloader = data_loader(x_test, y_test, batch_size, shuffle=False, drop_last=False)
 
-    return train_dataloader, val_dataloader, test_dataloader, scaler
+    return train_dataloader, val_dataloader, test_dataloader, [scaler0,scaler1,scaler2,scaler3]
 
 # For PEMS-Bay and METR-LA Datasets
 def get_dataloader_meta_la(args, normalizer='std', tod=False, dow=False, weather=False, single=True):
@@ -198,7 +214,7 @@ def Add_Window_Horizon(data, window=12, horizon=12):
     index = 0
     while index < total_num:
         X.append(data[index:index + window])
-        Y.append(data[index + window:index + window + horizon, :, :1])
+        Y.append(data[index + window:index + window + horizon, :, :])
         index = index + 1
     X = np.array(X)
     Y = np.array(Y)

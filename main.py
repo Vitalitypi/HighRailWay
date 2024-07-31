@@ -49,7 +49,7 @@ def init_model(model):
 
 #parser
 args = argparse.ArgumentParser(description='arguments')
-args.add_argument('--dataset', default='PEMS08', type=str)
+args.add_argument('--dataset', default='HighRailWay', type=str)
 args.add_argument('--mode', default='train', type=str)
 args.add_argument('--device', default='cuda:0', type=str, help='indices of GPUs')
 args.add_argument('--debug', default='False', type=eval)
@@ -128,12 +128,12 @@ model = model.to(args.device)
 model = init_model(model)
 
 #load dataset
-train_loader, val_loader, test_loader, scaler = get_dataloader_pems(args1.dataset,args.batch_size,
+train_loader, val_loader, test_loader, scalers = get_dataloader_pems(args1.dataset,args.batch_size,
                             args.val_ratio,args.test_ratio,args.in_steps,args.out_steps)
 
 #init loss function, optimizer
 if args.loss_func == 'mask_mae':
-    loss_generator = masked_mae_loss(scaler, mask_value=0.0)
+    loss_generator = masked_mae_loss(scalers[0], mask_value=0.0)
 elif args.loss_func == 'mae':
     loss_generator = torch.nn.L1Loss().to(args.device)
 elif args.loss_func == 'mse':
@@ -162,7 +162,7 @@ args.log_dir = log_dir
 #start training
 trainer = Trainer(args,
                   model,
-                  train_loader,val_loader,test_loader,scaler,
+                  train_loader,val_loader,test_loader,scalers,
                   loss_generator,
                   optimizer_G,
                   lr_scheduler_G
@@ -172,6 +172,6 @@ if args.mode == 'train':
 elif args.mode == 'test':
     model.load_state_dict(torch.load('./trained/{}/best_model.pth'.format(args.dataset)))
     print("Load saved model")
-    trainer.test(model, trainer.args, test_loader, scaler, trainer.logger)
+    trainer.test(model, trainer.args, test_loader, scalers, trainer.logger)
 else:
     raise ValueError
